@@ -2,44 +2,68 @@
 
 # Runs omarchy-uninstall on a throwaway Omarchy VM, then boots what is left.
 #
-#   test/vm [--keep] [--boot firmware|kernel]
+#   test/vm [--encrypted] [--keep] [--boot firmware|kernel]
 #
-# Fetches the installed Omarchy VM image that nightly.omarchy.org publishes
-# (the one Omarchy's own CI tests on), boots a copy-on-write overlay of it under
-# KVM, runs the uninstall in it over SSH with the desktop session ended, shuts
-# it down, and boots the same disk again through UEFI firmware, so Limine and
-# the rebuilt UKI are what bring it up. That second boot is checked over SSH:
-# no Omarchy packages, Arch's os-release, the stock kernel, a package manager
-# and network that work. Everything it saw lands in the run directory it
-# prints: the uninstall's output and log, the state before and after, serial
-# logs and screenshots of both boots.
+# Boots a copy-on-write overlay of an installed Omarchy under KVM, runs the
+# uninstall in it over SSH with the desktop session ended, shuts it down, and
+# boots the same disk again through UEFI firmware, so Limine and the rebuilt
+# UKI are what bring it up. That second boot is checked over SSH: no Omarchy
+# packages, Arch's os-release, the stock kernel, a package manager and network
+# that work. Everything it saw lands in the run directory it prints: the
+# uninstall's output and log, the state before and after, serial logs and
+# screenshots of both boots.
 #
-# The first boot goes through the firmware too, so the image's own boot chain
-# is proven before anything changes; --boot kernel loads the kernel directly
-# the way CI does instead. --keep leaves the run's disk behind for a look.
+# The base is the installed Omarchy VM image nightly.omarchy.org publishes
+# (the one Omarchy's own CI tests on): unencrypted, user omarchy. The first
+# boot goes through the firmware too, so the image's own boot chain is proven
+# before anything changes; --boot kernel loads the kernel directly the way CI
+# does instead.
 #
-# Env: OMARCHY_UNINSTALL_CACHE (image and runs, default ~/.cache/omarchy-uninstall),
-#      MEM (default 6G), SMP (default 4), SITE (default https://nightly.omarchy.org)
+# --encrypted installs its own base first, from the Omarchy ISO, unattended:
+# a LUKS-encrypted root the way the installer makes one (Btrfs with the @,
+# @home, @log and @pkg subvolumes on LUKS behind a 2 GiB ESP), with the
+# hostname, timezone, keyboard and user name below and a throwaway password
+# that is also the disk passphrase. The cidata drive the installer reads is
+# kept beside the base. The install takes a few minutes once; every firmware
+# boot of that base then types the passphrase at the prompt until SSH answers.
+#
+# --keep leaves the run's disk behind for a look; a failed run keeps it anyway.
+#
+# Env: OMARCHY_UNINSTALL_CACHE (images, ISO and runs, default ~/.cache/omarchy-uninstall),
+#      MEM (default 6G), SMP (default 4), SITE (default https://nightly.omarchy.org),
+#      GUEST_HOSTNAME, GUEST_TIMEZONE, GUEST_KEYBOARD, GUEST_USER, GUEST_PASSWORD
+#      (the encrypted install's identity), DISK_GB (its disk, default 40)
 
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 cache=${OMARCHY_UNINSTALL_CACHE:-$HOME/.cache/omarchy-uninstall}
 site=${SITE:-https://nightly.omarchy.org}
-image=$cache/image
 ovmf=/usr/share/edk2/x64
 keep=0
 first_boot=firmware
+encrypted=0
+
+# The encrypted install's identity: this laptop's, so the test machine looks
+# like the one the uninstall is for. The password is a throwaway for a VM
+# nobody keeps; it is also the LUKS passphrase, as the installer does it.
+GUEST_HOSTNAME=${GUEST_HOSTNAME:-us-pa-arch001}
+GUEST_TIMEZONE=${GUEST_TIMEZONE:-US/Eastern}
+GUEST_KEYBOARD=${GUEST_KEYBOARD:-us}
+GUEST_USER=${GUEST_USER:-evan}
+GUEST_PASSWORD=${GUEST_PASSWORD:-omarchy}
+DISK_GB=${DISK_GB:-40}
 
 while (($#)); do
   case $1 in
     --keep) keep=1 ;;
+    --encrypted) encrypted=1 ;;
     --boot)
       first_boot=${2:-}
       shift
       ;;
     *)
-      echo "Usage: test/vm [--keep] [--boot firmware|kernel]" >&2
+      echo "Usage: test/vm [--encrypted] [--keep] [--boot firmware|kernel]" >&2
       exit 1
       ;;
   esac
@@ -52,8 +76,12 @@ case $first_boot in
     exit 1
     ;;
 esac
+if (( encrypted )) && [[ $first_boot == "kernel" ]]; then
+  echo "test/vm: the encrypted base has no kernel to load directly; it boots through the firmware" >&2
+  exit 1
+fi
 
-for tool in qemu-system-x86_64 qemu-img ssh-keygen jq curl socat; do
+for tool in qemu-system-x86_64 qemu-img ssh-keygen jq curl socat genisoimage openssl; do
   command -v "$tool" >/dev/null || { echo "test/vm: $tool is needed" >&2; exit 1; }
 done
 [[ -f $ovmf/OVMF_CODE.4m.fd ]] || { echo "test/vm: edk2-ovmf is needed ($ovmf)" >&2; exit 1; }
@@ -63,6 +91,15 @@ mkdir -p "$run"
 port=$(( 20000 + RANDOM % 10000 ))
 uuid=$(cat /proc/sys/kernel/random/uuid)
 started=$SECONDS
+if (( encrypted )); then
+  image=$cache/image-encrypted
+  guest=$GUEST_USER
+  passphrase=$GUEST_PASSWORD
+else
+  image=$cache/image
+  guest=omarchy
+  passphrase=""
+fi
 
 seconds() { echo $(( SECONDS - started )); }
 
@@ -73,22 +110,53 @@ say() {
 ssh_vm() {
   ssh -i "$run/id_ed25519" -p "$port" -o BatchMode=yes -o IdentitiesOnly=yes \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o ConnectTimeout="${CONNECT_TIMEOUT:-5}" -o LogLevel=ERROR omarchy@127.0.0.1 "$@"
+    -o ConnectTimeout="${CONNECT_TIMEOUT:-5}" -o LogLevel=ERROR "$guest@127.0.0.1" "$@"
+}
+
+monitor() {
+  [[ -S $run/monitor.sock ]] || return 1
+  printf '%s\n' "$1" | socat - "UNIX-CONNECT:$run/monitor.sock" >/dev/null 2>&1
+}
+
+# Keystrokes on the VM's console, through the monitor: letters, digits and
+# the few punctuation marks a passphrase or a command line here needs.
+type_text() {
+  local text=$1 ch i key
+  for (( i = 0; i < ${#text}; i++ )); do
+    ch=${text:i:1}
+    case $ch in
+      [a-z0-9]) key=$ch ;;
+      [A-Z]) key="shift-${ch,,}" ;;
+      ' ') key='spc' ;;
+      .) key='dot' ;;
+      -) key='minus' ;;
+      _) key=shift-minus ;;
+      /) key='slash' ;;
+      *) say "type_text: cannot type '$ch'"; return 1 ;;
+    esac
+    monitor "sendkey $key" || return 1
+    sleep 0.05
+  done
+}
+
+fetch_manifest() {
+  mkdir -p "$cache"
+  curl -fsS --retry 3 -o "$cache/latest.json" "$site/stable/latest.json"
 }
 
 fetch_image() {
   mkdir -p "$image"
-  curl -fsS --retry 3 -o "$image/latest.json" "$site/stable/latest.json"
+  fetch_manifest
   local sha url unpacked version file
-  sha=$(jq -r .vm.sha256 "$image/latest.json")
-  url=$(jq -r .vm.url "$image/latest.json")
-  unpacked=$(jq -r .vm.unpacked "$image/latest.json")
-  version=$(jq -r .omarchy_version "$image/latest.json")
+  sha=$(jq -r .vm.sha256 "$cache/latest.json")
+  url=$(jq -r .vm.url "$cache/latest.json")
+  unpacked=$(jq -r .vm.unpacked "$cache/latest.json")
+  version=$(jq -r .omarchy_version "$cache/latest.json")
   if [[ -f $image/base.qcow2 && $(cat "$image/base.sha256" 2>/dev/null) == "$sha" ]]; then
     say "image cached: Omarchy $version"
     return 0
   fi
-  say "fetching the Omarchy $version image ($(( $(jq -r .vm.size "$image/latest.json") / 1048576 )) MB)"
+  say "fetching the Omarchy $version image ($(( $(jq -r .vm.size "$cache/latest.json") / 1048576 )) MB)"
   rm -f "$image/base.qcow2" "$image/base.sha256" "$image/vmlinuz" "$image/initrd" "$image/cmdline"
   curl -fL --retry 3 -C - -o "$image/base.qcow2.part" "$url"
   echo "$sha  $image/base.qcow2.part" | sha256sum -c - >/dev/null
@@ -100,20 +168,173 @@ fetch_image() {
   say "image fetched"
 }
 
+# The release ISO, for the encrypted install. Sets iso.
+fetch_iso() {
+  local sha url version
+  mkdir -p "$cache/iso"
+  fetch_manifest
+  sha=$(jq -r .sha256 "$cache/latest.json")
+  url=$(jq -r .url "$cache/latest.json")
+  version=$(jq -r .version "$cache/latest.json")
+  iso=$cache/iso/omarchy-$version.iso
+  if [[ -f $iso ]] && [[ $(cat "$iso.sha256" 2>/dev/null) == "$sha" ]]; then
+    say "ISO cached: Omarchy $version"
+    return 0
+  fi
+  say "fetching the Omarchy $version ISO ($(( $(jq -r .size "$cache/latest.json") / 1048576 )) MB)"
+  curl -fL --retry 3 -C - -o "$iso.part" "$url"
+  echo "$sha  $iso.part" | sha256sum -c - >/dev/null
+  mv "$iso.part" "$iso"
+  echo "$sha" >"$iso.sha256"
+  say "ISO fetched"
+}
+
+# The installer's own input files, the way its wizard writes them for a wiped
+# disk (omarchy-iso's integration harness is the model): a 1 MiB gap, a 2 GiB
+# ESP, the rest Btrfs with the installer's subvolumes, LUKS on that partition
+# by its archinstall identity, and the passphrase in both places archinstall
+# reads it. authorized_keys makes the install enable sshd and open its port.
+build_cidata() {
+  local dir=$1
+  local disk_bytes=$(( DISK_GB * 1024 * 1024 * 1024 ))
+  local mib=$(( 1024 * 1024 )) gib=$(( 1024 * 1024 * 1024 ))
+  local boot_start=$mib boot_size=$(( 2 * gib ))
+  local main_start=$(( boot_size + boot_start ))
+  local main_size=$(( disk_bytes - main_start - mib ))
+  local hash password_json
+  hash=$(openssl passwd -6 "$GUEST_PASSWORD")
+  password_json=$(jq -Rn --arg v "$GUEST_PASSWORD" '$v')
+
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  cat >"$dir/user_credentials.json" <<EOF
+{
+    "encryption_password": $password_json,
+    "root_enc_password": $(jq -Rn --arg v "$hash" '$v'),
+    "users": [
+        {
+            "enc_password": $(jq -Rn --arg v "$hash" '$v'),
+            "groups": [],
+            "sudo": true,
+            "username": $(jq -Rn --arg v "$GUEST_USER" '$v')
+        }
+    ]
+}
+EOF
+  cat >"$dir/user_configuration.json" <<EOF
+{
+    "app_config": null,
+    "archinstall-language": "English",
+    "auth_config": {},
+    "audio_config": { "audio": "pipewire" },
+    "bootloader_config": { "bootloader": "Limine", "uki": false, "removable": false },
+    "custom_commands": [],
+    "omarchy_install": {
+        "mode": "full_disk",
+        "defer_provisioning": false,
+        "target_mount": "/mnt",
+        "boot": {
+            "esp_mount": "/boot",
+            "esp_path": "/EFI/limine",
+            "efi_binary": "limine_x64.efi",
+            "enable_fallback": true
+        },
+        "storage": { "kernel": "linux-omarchy" }
+    },
+    "disk_config": {
+        "config_type": "default_layout",
+        "device_modifications": [
+            {
+                "device": "/dev/vda",
+                "partitions": [
+                    {
+                        "btrfs": [],
+                        "dev_path": null,
+                        "flags": [ "boot", "esp" ],
+                        "fs_type": "fat32",
+                        "mount_options": [],
+                        "mountpoint": "/boot",
+                        "obj_id": "ea21d3f2-82bb-49cc-ab5d-6f81ae94e18d",
+                        "size": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $boot_size },
+                        "start": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $boot_start },
+                        "status": "create",
+                        "type": "primary"
+                    },
+                    {
+                        "btrfs": [
+                            { "mountpoint": "/", "name": "@" },
+                            { "mountpoint": "/home", "name": "@home" },
+                            { "mountpoint": "/var/log", "name": "@log" },
+                            { "mountpoint": "/var/cache/pacman/pkg", "name": "@pkg" }
+                        ],
+                        "dev_path": null,
+                        "flags": [],
+                        "fs_type": "btrfs",
+                        "mount_options": [ "compress=zstd" ],
+                        "mountpoint": null,
+                        "obj_id": "8c2c2b92-1070-455d-b76a-56263bab24aa",
+                        "size": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $main_size },
+                        "start": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $main_start },
+                        "status": "create",
+                        "type": "primary"
+                    }
+                ],
+                "wipe": true
+            }
+        ],
+        "disk_encryption": {
+            "encryption_type": "luks",
+            "lvm_volumes": [],
+            "iter_time": 2000,
+            "partitions": [ "8c2c2b92-1070-455d-b76a-56263bab24aa" ],
+            "encryption_password": $password_json
+        }
+    },
+    "hostname": $(jq -Rn --arg v "$GUEST_HOSTNAME" '$v'),
+    "kernels": [ "linux-omarchy" ],
+    "network_config": { "type": "iso" },
+    "ntp": true,
+    "parallel_downloads": 8,
+    "script": null,
+    "services": [],
+    "swap": true,
+    "timezone": $(jq -Rn --arg v "$GUEST_TIMEZONE" '$v'),
+    "locale_config": { "kb_layout": $(jq -Rn --arg v "$GUEST_KEYBOARD" '$v'), "sys_enc": "UTF-8", "sys_lang": "en_US.UTF-8" },
+    "mirror_config": {
+        "custom_repositories": [],
+        "custom_servers": [
+            { "url": "https://mirror.omarchy.org/\$repo/os/\$arch" },
+            { "url": "https://geo.mirror.pkgbuild.com/\$repo/os/\$arch" }
+        ],
+        "mirror_regions": {},
+        "optional_repositories": []
+    },
+    "packages": [ "base-devel", "git", "omarchy-keyring", "omarchy-settings", "omarchy" ],
+    "profile_config": { "gfx_driver": null, "greeter": null, "profile": {} },
+    "version": "3.0.9"
+}
+EOF
+  echo true >"$dir/user_encrypt_installation.txt"
+  cp "$run/id_ed25519.pub" "$dir/authorized_keys"
+  jq . "$dir/user_configuration.json" >/dev/null
+  jq . "$dir/user_credentials.json" >/dev/null
+}
+
 # The key and the sudo grant for this run, handed in through the firmware
 # tables as a systemd credential the way CI does: the image holds neither.
 credentials() {
-  ssh-keygen -q -t ed25519 -N '' -C omarchy-uninstall-vm -f "$run/id_ed25519"
-  printf 'd /home/omarchy/.ssh 0700 omarchy omarchy -\nf+ /home/omarchy/.ssh/authorized_keys 0600 omarchy omarchy - %s\nf+ /etc/sudoers.d/90-vm-test 0440 root root - omarchy ALL=(ALL) NOPASSWD:ALL\\n\n' \
-    "$(cat "$run/id_ed25519.pub")" | base64 -w0
+  printf 'd /home/%s/.ssh 0700 %s %s -\nf+ /home/%s/.ssh/authorized_keys 0600 %s %s - %s\nf+ /etc/sudoers.d/90-vm-test 0440 root root - %s ALL=(ALL) NOPASSWD:ALL\\n\n' \
+    "$guest" "$guest" "$guest" "$guest" "$guest" "$guest" "$(cat "$run/id_ed25519.pub")" "$guest" | base64 -w0
 }
 
 boot_vm() {
-  local how=$1 label=$2
+  local how=$1 label=$2 disk=${3:-$run/run.qcow2}
+  shift 2
+  (( $# )) && shift
   # shellcheck disable=SC2054  # the commas are qemu's own option syntax
   local args=(
     -cpu host -enable-kvm -machine q35,accel=kvm -smp "${SMP:-4}" -m "${MEM:-6G}" -uuid "$uuid"
-    -drive "file=$run/run.qcow2,format=qcow2,if=none,id=d0" -device virtio-blk-pci,drive=d0
+    -drive "file=$disk,format=qcow2,if=none,id=d0" -device virtio-blk-pci,drive=d0,bootindex=1
     -smbios "type=11,value=io.systemd.credential.binary:tmpfiles.extra=$creds"
     -device virtio-vga -device virtio-rng-pci -display none
     -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:22" -device virtio-net-pci,netdev=n0
@@ -123,28 +344,42 @@ boot_vm() {
   if [[ $how == "kernel" ]]; then
     args+=(-kernel "$image/vmlinuz" -initrd "$image/initrd" -append "$(cat "$image/cmdline") systemd.tty.term.console=dumb")
   else
-    [[ -f $run/OVMF_VARS.fd ]] || cp "$ovmf/OVMF_VARS.4m.fd" "$run/OVMF_VARS.fd"
+    if [[ ! -f $run/OVMF_VARS.fd ]]; then
+      if [[ -f $image/OVMF_VARS.fd ]]; then
+        cp "$image/OVMF_VARS.fd" "$run/OVMF_VARS.fd"
+      else
+        cp "$ovmf/OVMF_VARS.4m.fd" "$run/OVMF_VARS.fd"
+      fi
+    fi
     args+=(-drive "if=pflash,format=raw,readonly=on,file=$ovmf/OVMF_CODE.4m.fd" -drive "if=pflash,format=raw,file=$run/OVMF_VARS.fd")
   fi
   rm -f "$run/qemu.pid" "$run/monitor.sock"
-  qemu-system-x86_64 "${args[@]}"
+  qemu-system-x86_64 "${args[@]}" "$@"
   say "booted ($how) as $label"
 }
 
 screenshot() {
   local label=$1
-  [[ -S $run/monitor.sock ]] || return 0
-  printf 'screendump %s\n' "$run/screen-$label.ppm" | socat - "UNIX-CONNECT:$run/monitor.sock" >/dev/null 2>&1 || return 0
+  monitor "screendump $run/screen-$label.ppm" || return 0
   sleep 0.5
   if command -v magick >/dev/null && [[ -f $run/screen-$label.ppm ]]; then
     magick "$run/screen-$label.ppm" "$run/screen-$label.png" 2>/dev/null && rm -f "$run/screen-$label.ppm"
   fi
 }
 
+# Types the passphrase and Enter at the console. Nothing says when the prompt
+# is up (the first boot is quiet), so it is typed on an interval: early
+# keystrokes are discarded by the prompt, late ones land on a login that
+# ignores them. It starts late enough to miss Limine's menu countdown, which
+# any key would stop.
+unlock_disk() {
+  type_text "$passphrase" && monitor "sendkey ret"
+}
+
 # Waits for SSH, taking a screenshot every 30 s so a boot that stops somewhere
-# leaves a picture of where.
+# leaves a picture of where, and typing the passphrase on an encrypted base.
 wait_ssh() {
-  local limit=$1 label=$2 from waited=0 shot=0
+  local limit=$1 label=$2 from waited=0 shot=0 typed=0
   from=$(seconds)
   until CONNECT_TIMEOUT=1 ssh_vm true 2>/dev/null; do
     waited=$(( $(seconds) - from ))
@@ -152,6 +387,10 @@ wait_ssh() {
     if (( waited - shot >= 30 )); then
       screenshot "$label-${waited}s"
       shot=$waited
+    fi
+    if [[ -n $passphrase ]] && (( waited >= 20 && waited - typed >= 10 )); then
+      unlock_disk
+      typed=$waited
     fi
     sleep 1
   done
@@ -163,7 +402,7 @@ stop_vm() {
   pid=$(cat "$run/qemu.pid" 2>/dev/null) || return 0
   # Over SSH where it answers, else the power button through the monitor.
   if ! CONNECT_TIMEOUT=3 ssh_vm 'sudo systemctl poweroff' >/dev/null 2>&1; then
-    printf 'system_powerdown\n' | socat - "UNIX-CONNECT:$run/monitor.sock" >/dev/null 2>&1 || true
+    monitor system_powerdown || true
   fi
   while kill -0 "$pid" 2>/dev/null && (( waited < 90 )); do
     sleep 1
@@ -177,6 +416,67 @@ stop_vm() {
   rm -f "$run/qemu.pid"
 }
 
+# The firmware names what it starts on the serial port: the ISO's medium
+# while the installer runs, the installed disk's Limine once it is over.
+installed_system_started() {
+  grep -aq 'starting Boot.*"Limine"' "$run/serial-install.log" 2>/dev/null
+}
+
+# A fresh encrypted Omarchy from the ISO, installed unattended from the cidata
+# drive onto a new disk, booted once to prove it and to let first-boot setup
+# finish, then shut down and kept as the base. The cidata files stay beside it.
+install_encrypted_base() {
+  local from waited=0 typed=0 shot=0 rebooted=""
+  fetch_iso
+  mkdir -p "$image"
+  say "installing an encrypted Omarchy into $image (hostname $GUEST_HOSTNAME, user $GUEST_USER, ${DISK_GB}G disk)"
+  build_cidata "$image/cidata"
+  genisoimage -quiet -output "$run/cidata.iso" -volid cidata -joliet -rock "$image/cidata"
+
+  rm -f "$image/base.qcow2" "$image/base.qcow2.building" "$image/OVMF_VARS.fd"
+  qemu-img create -qf qcow2 "$image/base.qcow2.building" "${DISK_GB}G"
+  MEM=${INSTALL_MEM:-8G} boot_vm firmware install "$image/base.qcow2.building" \
+    -drive "file=$iso,media=cdrom,if=none,format=raw,id=cdrom0" -device ide-cd,drive=cdrom0,bootindex=2 \
+    -drive "file=$run/cidata.iso,media=cdrom,if=none,format=raw,id=cidata" -device ide-cd,drive=cidata,bus=ide.1
+
+  from=$(seconds)
+  until CONNECT_TIMEOUT=1 ssh_vm true 2>/dev/null; do
+    waited=$(( $(seconds) - from ))
+    if (( waited >= ${INSTALL_TIMEOUT:-2400} )); then
+      screenshot install-timeout
+      say "the install did not finish in ${INSTALL_TIMEOUT:-2400} s (see screen-install-*.png and serial-install.log)"
+      return 1
+    fi
+    if ! kill -0 "$(cat "$run/qemu.pid" 2>/dev/null)" 2>/dev/null; then
+      say "the VM exited during the install"
+      return 1
+    fi
+    if [[ -z $rebooted ]] && installed_system_started; then
+      rebooted=$waited
+      say "install finished after about ${waited} s; waiting for the first boot"
+      typed=$waited
+    fi
+    if [[ -n $rebooted ]] && (( waited - typed >= 10 )); then
+      unlock_disk
+      typed=$waited
+    fi
+    if (( waited - shot >= 120 )); then
+      screenshot "install-${waited}s"
+      shot=$waited
+      [[ -n $rebooted ]] || say "  installing (${waited} s)"
+    fi
+    sleep 2
+  done
+  say "the installed system answers SSH after $(( $(seconds) - from )) s"
+
+  ssh_vm 'timeout 300 systemctl is-system-running --wait >/dev/null 2>&1; true'
+  ssh_vm 'sudo cat /var/log/omarchy-install.log' >"$image/omarchy-install.log" 2>/dev/null || true
+  stop_vm
+  mv "$image/base.qcow2.building" "$image/base.qcow2"
+  cp "$run/OVMF_VARS.fd" "$image/OVMF_VARS.fd"
+  say "encrypted base ready: $image/base.qcow2"
+}
+
 # The disk stays for a look after a failed run, and after any run with --keep.
 cleanup() {
   local status=$?
@@ -187,7 +487,7 @@ cleanup() {
   else
     rm -f "$run/run.qcow2" "$run/OVMF_VARS.fd"
   fi
-  rm -f "$run/monitor.sock"
+  rm -f "$run/monitor.sock" "$run/cidata.iso"
 }
 trap cleanup EXIT
 
@@ -209,6 +509,8 @@ state_report() {
     echo "== cmdline";     cat /proc/cmdline
     echo "== os-release";  head -3 /etc/os-release
     echo "== machine-id";  cat /etc/machine-id
+    echo "== hostname";    hostname; timedatectl show -p Timezone --value 2>/dev/null
+    echo "== block devices"; lsblk -o NAME,FSTYPE,TYPE,MOUNTPOINTS
     echo "== omarchy packages"; pacman -Qq 2>/dev/null | grep -E "^omarchy|^linux" | tr "\n" " "; echo
     echo "== package count"; pacman -Qq 2>/dev/null | wc -l
     echo "== foreign packages"; pacman -Qmq 2>/dev/null | tr "\n" " "; echo
@@ -226,29 +528,37 @@ state_report() {
     echo "== errors this boot"; journalctl -b -p err --no-pager 2>&1 | tail -20'
 }
 
-fetch_image
+ssh-keygen -q -t ed25519 -N '' -C omarchy-uninstall-vm -f "$run/id_ed25519"
 creds=$(credentials)
+if (( encrypted )); then
+  if [[ -f $image/base.qcow2 ]]; then
+    say "encrypted base cached: $image/base.qcow2"
+  else
+    install_encrypted_base
+  fi
+else
+  fetch_image
+fi
 qemu-img create -qf qcow2 -b "$(realpath "$image/base.qcow2")" -F qcow2 "$run/run.qcow2"
 say "run directory: $run"
 
-# Phase 1: the image as published, and the uninstall on it.
+# Phase 1: the base as it is, and the uninstall on it.
 boot_vm "$first_boot" before
-if ! wait_ssh 240 before; then
-  if [[ $first_boot == "firmware" ]]; then
-    say "the image did not come up through the firmware in 240 s; loading the kernel directly instead"
+if ! wait_ssh 300 before; then
+  if [[ $first_boot == "firmware" && ! $encrypted -eq 1 ]]; then
+    say "the image did not come up through the firmware in 300 s; loading the kernel directly instead"
     screenshot before-firmware-stuck
     stop_vm
     boot_vm kernel before
     wait_ssh 300 before || { say "no SSH after a direct kernel boot either"; exit 1; }
   else
-    say "no SSH after 240 s"
+    say "no SSH after 300 s"
     exit 1
   fi
 fi
 state_report >"$run/before.txt" 2>&1 || true
 screenshot before
 
-ssh_vm 'cat >~/omarchy-uninstall && chmod +x ~/omarchy-uninstall' <"$root/omarchy-uninstall"
 # The published image is built with an empty machine-id, so each VM takes its
 # own from -uuid at first boot, and the boot entry the build wrote is keyed to
 # no machine. An installed Omarchy's entry carries the machine's id, which is
@@ -256,6 +566,7 @@ ssh_vm 'cat >~/omarchy-uninstall && chmod +x ~/omarchy-uninstall' <"$root/omarch
 # so the test exercises a real machine's boot rebuild and not the image's quirk.
 ssh_vm 'id=$(cat /etc/machine-id); sudo sed -i "/^\/+Omarchy/,/^\/[^\/]/ s/^comment: order-priority=/comment: machine-id=$id order-priority=/" /boot/limine.conf'
 
+ssh_vm 'cat >~/omarchy-uninstall && chmod +x ~/omarchy-uninstall' <"$root/omarchy-uninstall"
 # shellcheck disable=SC2088  # the tilde expands in the VM's shell
 ssh_vm '~/omarchy-uninstall --dry-run' >"$run/dry-run.txt" 2>&1 || say "the dry run exited $? (see dry-run.txt)"
 say "dry run done: $(grep -c '^    [a-z0-9]' "$run/dry-run.txt") packages listed"
@@ -265,7 +576,7 @@ end_desktop
 # The uninstall's output also goes to the serial console, which this side reads
 # as a file, so progress and the finishing line arrive even if SSH dies: the
 # image's kernel command line names ttyS0 as a console.
-command='set -o pipefail; /home/omarchy/omarchy-uninstall --yes 2>&1 | tee /var/tmp/uninstall.log >/dev/ttyS0; rc=$?; echo "$rc" >/var/tmp/uninstall.rc; echo "UNINSTALL-DONE rc=$rc" >/dev/ttyS0'
+command="set -o pipefail; /home/$guest/omarchy-uninstall --yes 2>&1 | tee /var/tmp/uninstall.log >/dev/ttyS0; rc=\$?; echo \"\$rc\" >/var/tmp/uninstall.rc; echo \"UNINSTALL-DONE rc=\$rc\" >/dev/ttyS0"
 ssh_vm "sudo systemd-run --quiet --collect --unit=omarchy-uninstall-test bash -c $(printf %q "$command")"
 say "uninstall started"
 from=$(seconds)
@@ -320,6 +631,7 @@ check() {
   fi
 }
 grep_after() { grep -qE "$1" "$run/after-boot.txt"; }
+section() { sed -n "/^== $1/,/^== /p" "$run/after-boot.txt"; }
 check bash -c "! grep -qE '^omarchy(-| |$)' <(sed -n '/^== omarchy packages/{n;p}' '$run/after-boot.txt')" "no omarchy packages remain"
 check bash -c "sed -n '/^== kernel/{n;p}' '$run/after-boot.txt' | grep -qv omarchy" "the stock kernel boots"
 check grep_after '^ID=arch$' "os-release is Arch's again"
@@ -330,6 +642,10 @@ check bash -c "sed -n '/^== home/{n;p}' '$run/after-boot.txt' | grep -q omarchy-
 check bash -c "! grep -q 'kernel-id=linux-omarchy' '$run/after-boot.txt'" "no boot entry is left for the removed kernel"
 check bash -c "grep -q '^/+Arch Linux' '$run/after-boot.txt'" "the boot menu's OS entry is Arch Linux"
 check bash -c "[[ \$(grep -o '^UNINSTALL-DONE rc=[0-9]*' '$run/serial-before.log' | tail -n 1) == 'UNINSTALL-DONE rc=0' ]]" "the uninstall exited 0"
+if (( encrypted )); then
+  check bash -c "sed -n '/^== block devices/,/^== /p' '$run/after-boot.txt' | grep -q ' crypt '" "the root is still unlocked from LUKS"
+  check bash -c "sed -n '/^== cmdline/{n;p}' '$run/after-boot.txt' | grep -q cryptdevice=" "the kernel command line still names the LUKS device"
+fi
 
 if (( verdict == 0 )); then
   say "PASS: Omarchy uninstalled and the machine boots plain Arch Linux"
