@@ -1,0 +1,747 @@
+#!/bin/bash
+
+# omarchy:summary=Remove Omarchy from this computer, leaving plain Arch Linux that boots to a text login
+# omarchy:args=[--dry-run] [--yes]
+# omarchy:examples=omarchy uninstall --dry-run | sudo omarchy-uninstall
+# omarchy:requires-sudo=true
+
+# Undoes what the installer and the setup commands laid on top of Arch Linux:
+# the Omarchy packages and the default package set (the Hyprland desktop, SDDM,
+# Plymouth and the preinstalled apps), the Omarchy package repository and its
+# signing key, the system configuration and services the setup leaves wrote,
+# the factory-reset snapshot, and the configuration seeded into each user's
+# home, which is moved aside rather than deleted. The base system stays: the
+# disk layout and encryption, Limine and snapper, the kernel, firmware and
+# hardware fixes, NetworkManager, and whatever the owner installed themselves.
+# A machine running linux-omarchy gets the stock Arch kernel first, so what
+# boots afterwards is a kernel its remaining repositories update.
+#
+# Platforms whose kernel, firmware and boot chain come from Omarchy's platform
+# packages (Apple Silicon, Snapdragon, the N1x and the GB10) have no plain Arch
+# Linux ARM underneath to return to, and are turned away.
+#
+# Up to the package removal every step is harmless on its own and a failure
+# stops the run; after it each step is best effort, so a late failure never
+# leaves the machine half-converted with no command left to finish the job.
+
+set -euo pipefail
+
+export OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
+export PATH="$OMARCHY_PATH/bin:$PATH"
+
+LOG_FILE=/var/log/omarchy-uninstall.log
+STAMP=$(date +%Y%m%d-%H%M%S)
+
+# Default-set packages a plain Arch Linux still wants: sudo and the build tools
+# come with base-devel, networking with NetworkManager, Wi-Fi with its
+# regulatory database.
+KEEP_PACKAGES=(base-devel networkmanager wireless-regdb)
+
+# Marked explicitly installed before the removal, together with the base system
+# the ISO pacstraps (install/omarchy-other.packages), so the recursive
+# dependency sweep never takes the boot chain, the kernel, filesystem tools or
+# networking along with the desktop that happened to pull them in.
+PROTECT_PACKAGES=(linux linux-headers linux-lts linux-lts-headers linux-zen linux-zen-headers sudo networkmanager mkinitcpio cryptsetup lvm2 dosfstools e2fsprogs efibootmgr amd-ucode intel-ucode wireless-regdb)
+
+# Services the default set enables, disabled before their packages go so no
+# enablement link is left dangling. Networking, resolved, oomd and snapper stay.
+DISABLE_UNITS=(sddm.service cups.service cups.socket cups.path cups-browsed.service avahi-daemon.service avahi-daemon.socket docker.service docker.socket power-profiles-daemon.service ufw.service linux-modules-cleanup.service bluetooth.service plocate-updatedb.timer)
+
+# Per-user directories that are Omarchy's outright, moved aside whole.
+USER_OMARCHY_DIRS=(.config/omarchy .config/hypr .local/share/omarchy .local/state/omarchy)
+
+# Seeded trees an application takes over as its own state, so they are the
+# owner's whatever they mention: Chromium rewrites its first-run Preferences
+# into the live profile, and that profile names Omarchy's extensions.
+USER_APP_OWNED_DIRS=(.config/chromium)
+
+# Where omarchy-provision-user links the agent skills into $OMARCHY_PATH.
+USER_SKILL_DIRS=(.agents/skills .claude/skills .codex/skills .pi/agent/skills .gemini/config/skills .hermes/skills)
+
+dry_run=0
+assume_yes=0
+swap_kernel=0
+platform=""
+
+usage() {
+  cat <<USAGE
+Usage: omarchy-uninstall [--dry-run] [--yes]
+
+Removes Omarchy from this computer and leaves plain Arch Linux behind, booting
+to a text login. Log out of the desktop and run it from a console
+(Ctrl+Alt+F3).
+
+  --dry-run   Show what would be removed, changed and moved; change nothing
+  --yes       Skip the confirmation and the reboot question
+USAGE
+}
+
+args=("$@")
+while (($#)); do
+  case $1 in
+    --dry-run) dry_run=1 ;;
+    --yes | -y) assume_yes=1 ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+# A dry run only reads, so it needs no password. The caller's OMARCHY_PATH goes
+# along, as sudo would otherwise drop it and point root at the package while a
+# dev-linked checkout runs this.
+if (( EUID != 0 && !dry_run )); then
+  exec sudo env OMARCHY_PATH="$OMARCHY_PATH" "${BASH_SOURCE[0]}" "${args[@]}"
+fi
+
+log() {
+  (( dry_run )) || printf '%s %s\n' "$(date '+%H:%M:%S')" "$1" >>"$LOG_FILE"
+}
+
+say() {
+  printf '%s\n' "$1"
+  log "$1"
+}
+
+warn() {
+  printf 'Warning: %s\n' "$1" >&2
+  log "Warning: $1"
+}
+
+fail() {
+  printf 'Error: %s\n' "$1" >&2
+  exit 1
+}
+
+step() {
+  echo
+  say "== $1"
+}
+
+# Runs a command, or in a dry run says what it would run. A failure is reported
+# and returned, not fatal by itself: before the removal errexit stops the run,
+# after it the caller carries on with the next step.
+run() {
+  local status=0
+  if (( dry_run )); then
+    printf '  would run: %s\n' "$*"
+    return 0
+  fi
+  log "+ $*"
+  "$@" 2>&1 | tee -a "$LOG_FILE" || status=$?
+  if (( status != 0 )); then
+    warn "failed with status $status: $*"
+  fi
+  return "$status"
+}
+
+# Writes stdin to a file, or in a dry run shows what it would write.
+put() {
+  local path=$1 content
+  content=$(cat)
+  if (( dry_run )); then
+    printf '  would write %s:\n' "$path"
+    printf '%s\n' "$content" | sed 's/^/    | /'
+    return 0
+  fi
+  log "+ write $path"
+  printf '%s\n' "$content" >"$path"
+}
+
+stock_bashrc() {
+  cat <<'EOF'
+#
+# ~/.bashrc
+#
+
+# If not running interactively, don't do anything
+[[ $- != *i* ]] && return
+
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
+PS1='[\u@\h \W]\$ '
+EOF
+}
+
+# name:uid:gid:home for every account with a home directory on disk.
+human_users() {
+  local name uid gid home
+  while IFS=: read -r name uid gid home; do
+    [[ -d $home ]] && printf '%s:%s:%s:%s\n' "$name" "$uid" "$gid" "$home"
+  done < <(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 { print $1 ":" $3 ":" $4 ":" $6 }')
+}
+
+# Users with a desktop session open. Removing the desktop under one would end
+# the session and, with it, this very run.
+graphical_session_users() {
+  local id props type class name
+  while read -r id _; do
+    [[ -n $id ]] || continue
+    props=$(loginctl show-session "$id" -p Type -p Class -p Name 2>/dev/null) || continue
+    type=$(sed -n 's/^Type=//p' <<<"$props")
+    class=$(sed -n 's/^Class=//p' <<<"$props")
+    name=$(sed -n 's/^Name=//p' <<<"$props")
+    case $type in
+      wayland | x11 | mir) ;;
+      *) continue ;;
+    esac
+    case $class in
+      user | user-early | user-incomplete) printf '%s\n' "$name" ;;
+    esac
+  done < <(loginctl list-sessions --no-legend 2>/dev/null)
+}
+
+# Installs from before omarchy-hw-platform know only one platform for sure.
+detect_platform() {
+  if command -v omarchy-hw-platform >/dev/null 2>&1; then
+    omarchy-hw-platform
+    return
+  fi
+  [[ $(uname -m) == "x86_64" ]] || return 1
+  echo x86
+}
+
+package_names() {
+  sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$@"
+}
+
+# The platform's default package set, composed the way omarchy-pkg-defaults
+# composes it where an install predates that command.
+default_packages() {
+  if command -v omarchy-pkg-defaults >/dev/null 2>&1; then
+    omarchy-pkg-defaults "$platform"
+    return
+  fi
+  local lists=("$OMARCHY_PATH/install/omarchy-base.packages") list
+  for list in omarchy-aarch64.packages "omarchy-$platform.packages"; do
+    [[ $platform == aarch64* && -f $OMARCHY_PATH/install/$list ]] && lists+=("$OMARCHY_PATH/install/$list")
+  done
+  if [[ $platform == "x86" || ! -f $OMARCHY_PATH/install/omarchy-x86_64-only.packages ]]; then
+    package_names "${lists[@]}" | awk '!seen[$0]++'
+  else
+    package_names "${lists[@]}" | grep -vxF -f <(package_names "$OMARCHY_PATH/install/omarchy-x86_64-only.packages") | awk '!seen[$0]++'
+  fi
+}
+
+omarchy_repo_packages() {
+  local repo
+  for repo in $(pacman-conf --repo-list 2>/dev/null | grep '^omarchy' || true); do
+    pacman -Slq "$repo" 2>/dev/null || true
+  done
+}
+
+preflight() {
+  pacman -Qq omarchy >/dev/null 2>&1 || fail "the omarchy package is not installed; there is nothing to uninstall"
+
+  platform=$(detect_platform) || fail "could not tell this machine's platform: this Omarchy predates omarchy-hw-platform and the machine is not x86"
+  [[ -f $OMARCHY_PATH/install/omarchy-base.packages ]] || fail "no package lists under $OMARCHY_PATH/install; is Omarchy installed there?"
+  case $platform in
+    x86 | aarch64) ;;
+    *) fail "$platform keeps its kernel, firmware and boot chain in Omarchy's platform packages; there is no plain Arch Linux underneath to return to" ;;
+  esac
+
+  if pacman -Qq linux-omarchy >/dev/null 2>&1; then
+    [[ $platform == "x86" ]] || fail "linux-omarchy is installed, and only x86 has a stock kernel (linux) this command can put in its place"
+    swap_kernel=1
+  fi
+
+  local sessions
+  sessions=$(graphical_session_users | sort -u | tr '\n' ' ')
+  if [[ -n $sessions ]]; then
+    if (( dry_run )); then
+      warn "a desktop session is open for: ${sessions% }. The real run needs them logged out, and runs from a console (Ctrl+Alt+F3)"
+    else
+      fail "a desktop session is open for: ${sessions% }. Log out, switch to a console (Ctrl+Alt+F3), log in there and run this again"
+    fi
+  fi
+}
+
+# Everything the later steps need from the packages, read before they go.
+gather() {
+  mapfile -t installed < <(pacman -Qq | sort -u)
+
+  mapfile -t targets < <(
+    {
+      default_packages
+      printf '%s\n' "${installed[@]}" | grep -E '^omarchy(-|$)' || true
+      (( swap_kernel )) && printf '%s\n' linux-omarchy linux-omarchy-headers
+    } | grep -vxF -f <(printf '%s\n' "${KEEP_PACKAGES[@]}") | sort -u |
+      comm -12 - <(printf '%s\n' "${installed[@]}")
+  )
+
+  mapfile -t protect < <(
+    {
+      package_names "$OMARCHY_PATH/install/omarchy-other.packages" 2>/dev/null || true
+      printf '%s\n' "${PROTECT_PACKAGES[@]}"
+    } | grep -vE '^linux-omarchy|-debug$' | sort -u |
+      comm -12 - <(printf '%s\n' "${installed[@]}") |
+      comm -23 - <(printf '%s\n' "${targets[@]}")
+  )
+
+  mapfile -t seeded < <(pacman -Qlq omarchy-settings omarchy 2>/dev/null | sed -n 's|^/etc/skel/||p' | grep -v '/$' | sort -u)
+  mapfile -t owned_mkinitcpio < <(pacman -Qlq omarchy-settings 2>/dev/null | grep '^/etc/mkinitcpio\.conf\.d/.*\.conf$' | sort)
+  mapfile -t owned_limine < <(pacman -Qlq omarchy-settings 2>/dev/null | grep '^/etc/limine-entry-tool\.d/.*\.conf$' | sort)
+  mapfile -t key_fingerprints < <(sed -n 's/^\([0-9A-Fa-f]\{40\}\):.*/\1/p' /usr/share/pacman/keyrings/omarchy-trusted 2>/dev/null)
+  mapfile -t repo_packages < <(omarchy_repo_packages | sort -u)
+  mapfile -t users < <(human_users)
+}
+
+confirm() {
+  echo
+  echo "This removes Omarchy from this computer and leaves plain Arch Linux behind."
+  echo
+  echo "It will:"
+  echo "  - remove ${#targets[@]} packages: Omarchy, the Hyprland desktop, SDDM, Plymouth and the apps"
+  echo "    Omarchy installs by default, plus the libraries only they needed (--dry-run lists them)"
+  (( swap_kernel )) && echo "  - install the stock Arch kernel (linux) in place of linux-omarchy"
+  echo "  - drop Omarchy's package repository and signing key from pacman"
+  echo "  - remove Omarchy's system configuration, services and factory-reset snapshot"
+  echo "  - move each user's Omarchy configuration to ~/omarchy-uninstalled-$STAMP (only caches are deleted)"
+  echo
+  echo "It keeps the disk layout, encryption, Limine, snapper, NetworkManager, the hardware fixes,"
+  echo "and everything you installed yourself. Afterwards the computer boots to a text login,"
+  echo "ready for whichever desktop you install next."
+  echo
+  (( dry_run || assume_yes )) && return 0
+
+  local typed
+  read -rp 'Type "uninstall" to continue: ' typed
+  [[ $typed == "uninstall" ]] || fail "not confirmed; nothing was changed"
+}
+
+# The HOOKS mkinitcpio ends up with from a main file and the given drop-ins,
+# sourced the way mkinitcpio sources them, so the drop-ins' own detection runs.
+effective_hooks() {
+  local conf=$1
+  shift
+  (
+    set +eu
+    HOOKS=()
+    [[ -f $conf ]] && source "$conf"
+    local file
+    for file in "$@"; do
+      [[ -f $file ]] && source "$file"
+    done
+    printf '%s\n' "${HOOKS[@]}"
+  ) 2>/dev/null
+}
+
+# The limine-entry-tool settings the given drop-ins set, less Omarchy's
+# branding and Plymouth's kernel parameters: UKIs stay on, the fallback and
+# other bootloaders' entries stay found, and the snapshot entries keep their
+# limits.
+kept_limine_settings() {
+  (
+    set +eu
+    # shellcheck disable=SC2034  # the drop-ins append to it
+    declare -A KERNEL_CMDLINE=()
+    local file
+    for file in "$@"; do
+      [[ -f $file ]] && source "$file"
+    done
+    local name
+    for name in ENABLE_UKI ENABLE_LIMINE_FALLBACK FIND_BOOTLOADERS MAX_SNAPSHOT_ENTRIES SNAPSHOT_FORMAT_CHOICE; do
+      [[ -n ${!name} ]] && printf '%s=%s\n' "$name" "${!name}"
+    done
+  ) 2>/dev/null
+}
+
+# Omarchy's packages carry the drop-ins that make the initramfs unlock and
+# mount the root and that shape the boot entries. Their effect is written to
+# files nothing owns before the packages go, minus Plymouth, which goes too.
+keep_boot_config() {
+  local etc=$1
+  local with without kept settings
+
+  mapfile -t with < <(effective_hooks "$etc/mkinitcpio.conf" "${owned_mkinitcpio[@]}")
+  mapfile -t without < <(effective_hooks "$etc/mkinitcpio.conf")
+  mapfile -t kept < <(printf '%s\n' "${with[@]}" | grep -vxE 'plymouth|plymouth-shutdown' || true)
+  local owned_set_hooks=0 had_plymouth=0
+  [[ ${with[*]} == "${without[*]}" ]] || owned_set_hooks=1
+  [[ ${with[*]} == "${kept[*]}" ]] || had_plymouth=1
+  if (( ${#with[@]} && (owned_set_hooks || had_plymouth) )); then
+    put "$etc/mkinitcpio.conf.d/00-hooks.conf" <<EOF
+# Written by omarchy-uninstall. The HOOKS this machine booted with under
+# Omarchy, minus Plymouth's, kept so the initramfs still unlocks and mounts the
+# root once Omarchy's own drop-in is gone. Edit or delete as you like.
+HOOKS=(${kept[*]})
+EOF
+  fi
+
+  mapfile -t settings < <(kept_limine_settings "${owned_limine[@]}")
+  if (( ${#settings[@]} )); then
+    put "$etc/limine-entry-tool.d/10-boot-entries.conf" <<EOF
+# Written by omarchy-uninstall. The limine-entry-tool settings this machine
+# booted with under Omarchy, minus its branding and Plymouth's kernel
+# parameters. Edit or delete as you like.
+$(printf '%s\n' "${settings[@]}")
+EOF
+  fi
+}
+
+install_stock_kernel() {
+  (( swap_kernel )) || return 0
+  local packages=(linux)
+  pacman -Qq linux-omarchy-headers >/dev/null 2>&1 && packages+=(linux-headers)
+  # The refresh keeps a rotated mirror from turning the kernel's download into
+  # a 404. The partial upgrade it risks is of a desktop about to be removed,
+  # and the owner is told to pacman -Syu once it is gone.
+  run pacman -Sy --needed --noconfirm "${packages[@]}"
+}
+
+protect_base_system() {
+  (( ${#protect[@]} )) || return 0
+  run pacman -D -q --asexplicit "${protect[@]}"
+}
+
+disable_services() {
+  local unit
+  for unit in "${DISABLE_UNITS[@]}"; do
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+      run systemctl disable --quiet "$unit"
+    fi
+  done
+  # Omarchy masks the wait-online units so boot never waits on the network.
+  run systemctl unmask --quiet NetworkManager-wait-online.service systemd-networkd-wait-online.service
+}
+
+remove_packages() {
+  (( ${#targets[@]} )) || return 0
+  if (( dry_run )); then
+    echo "  would remove these packages, with the dependencies only they needed:"
+    pacman -Rsu --print --print-format '    %n' "${targets[@]}" 2>&1 || true
+    return 0
+  fi
+  # --unneeded leaves out a target something the owner installed still needs,
+  # rather than refusing the whole removal over it.
+  run pacman -Rnsu --noconfirm "${targets[@]}"
+}
+
+# Drops every [omarchy*] repository section from a pacman.conf, keeping the
+# rest byte for byte.
+strip_omarchy_repos() {
+  local conf=$1 tmp
+  tmp=$(mktemp)
+  awk '
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { skipping = ($0 ~ /^[[:space:]]*\[omarchy/) }
+    !skipping { print }
+  ' "$conf" >"$tmp"
+  cat "$tmp" >"$conf"
+  rm -f "$tmp"
+}
+
+restore_mirrorlist() {
+  local list=/etc/pacman.d/mirrorlist
+  grep -qs 'omarchy' "$list" || return 0
+  # pacman-mirrorlist leaves its own list beside Omarchy's as a .pacnew.
+  if [[ -f $list.pacnew ]] && ! grep -q omarchy "$list.pacnew"; then
+    run mv -f "$list.pacnew" "$list"
+    return 0
+  fi
+  if [[ $platform == "x86" ]]; then
+    put "$list" <<'EOF'
+# Written by omarchy-uninstall in place of Omarchy's mirror. Arch's geo mirror
+# picks one nearby; https://archlinux.org/mirrorlist/ or reflector give more.
+Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
+EOF
+  else
+    put "$list" <<'EOF'
+# Written by omarchy-uninstall in place of Omarchy's mirror.
+Server = http://mirror.archlinuxarm.org/$arch/$repo
+EOF
+  fi
+}
+
+forget_repository() {
+  local fpr
+  for fpr in "${key_fingerprints[@]}"; do
+    run pacman-key --delete "$fpr"
+  done
+  if grep -q '^\[omarchy' /etc/pacman.conf; then
+    run strip_omarchy_repos /etc/pacman.conf
+  fi
+  restore_mirrorlist
+}
+
+# What the setup leaves and the omarchy-settings scriptlet wrote outside any
+# package, and the stray files package removal leaves behind.
+clean_system_files() {
+  local path dir
+
+  # omarchy-settings replaces the os-release symlink with Omarchy's own file.
+  if [[ ! -L /etc/os-release ]]; then
+    run ln -sfn ../usr/lib/os-release /etc/os-release
+  fi
+  run sed -i 's/ mdns_minimal \[NOTFOUND=return\]//' /etc/nsswitch.conf
+  run sed -i \
+    -e 's|^\(auth[[:space:]]\+required[[:space:]]\+pam_faillock.so[[:space:]]\+preauth\) silent deny=10 unlock_time=120$|\1|' \
+    -e 's|^\(auth[[:space:]]\+\[default=die\][[:space:]]\+pam_faillock.so[[:space:]]\+authfail\) deny=10 unlock_time=120$|\1|' \
+    /etc/pam.d/system-auth
+  run sed -i 's/^deny = 10$/# deny = 3/' /etc/security/faillock.conf
+  run sed -i '/^# Omarchy: give SSH commands/,/^PATH[[:space:]]\+DEFAULT=/d' /etc/security/pam_env.conf
+  if grep -qs omarchy /etc/skel/.bashrc; then
+    stock_bashrc | put /etc/skel/.bashrc
+  fi
+
+  for path in /usr/share/omarchy /etc/omarchy /var/lib/omarchy /etc/omarchy.conf /etc/sudoers.d/omarchy-dev-path \
+    /etc/ssh/ssh_config.d/20-omarchy-keepalive.conf /usr/lib/chromium/initial_preferences \
+    /usr/share/icons/Yaru/scalable/actions/go-previous-symbolic.svg /usr/share/icons/Yaru/scalable/actions/go-next-symbolic.svg \
+    /etc/skel/.config/omarchy /etc/skel/.local/state/omarchy /etc/skel/.local/share/omarchy; do
+    [[ -e $path || -L $path ]] && run rm -rf "$path"
+  done
+  for dir in /etc/chromium /etc/opt/chrome /etc/opt/edge /etc/brave; do
+    for path in "$dir/policies/managed/omarchy.json" "$dir/policies/managed/color.json"; do
+      [[ -e $path ]] && run rm -f "$path"
+    done
+  done
+  for path in /etc/sudoers.d/99-omarchy-nopasswd-* /var/log/omarchy-*.log; do
+    [[ -e $path && $path != "$LOG_FILE" ]] && run rm -f "$path"
+  done
+  if ! pacman -Qq sddm >/dev/null 2>&1; then
+    run rm -rf /etc/sddm.conf.d
+  fi
+
+  run find /etc/systemd/system /etc/systemd/user -xtype l \( -path '*.wants/*' -o -path '*.requires/*' \) -delete
+  run systemctl daemon-reload
+}
+
+# Whether a relative path lies inside one of the given relative directories.
+under_any_of() {
+  local path=$1 dir
+  shift
+  for dir in "$@"; do
+    [[ $path == "$dir"/* ]] && return 0
+  done
+  return 1
+}
+
+# Removes the directories a retired file leaves empty, up to but excluding the
+# home directory itself.
+prune_empty_parents() {
+  local home=$1 dir=$2
+  (( dry_run )) && return 0
+  while [[ $dir == "$home"/* ]]; do
+    rmdir "$dir" 2>/dev/null || break
+    dir=$(dirname "$dir")
+  done
+}
+
+retire_path() {
+  local home=$1 backup=$2 uid=$3 gid=$4 rel=$5 dir
+  dir=$(dirname "$rel")
+  run install -d -o "$uid" -g "$gid" "$backup/$dir"
+  run mv "$home/$rel" "$backup/$rel"
+  prune_empty_parents "$home" "$home/$dir"
+}
+
+# Moves what Omarchy put in a home directory into a backup folder there. A
+# seeded file that still points at Omarchy goes with it; one the owner has made
+# their own, or that never referred to Omarchy, stays. Only caches are deleted.
+retire_user_config() {
+  local name=$1 uid=$2 gid=$3 home=$4 backup rel path dir
+  local dirs=()
+  backup="$home/omarchy-uninstalled-$STAMP"
+  say "Moving $name's Omarchy configuration to $backup"
+
+  for rel in "${USER_OMARCHY_DIRS[@]}"; do
+    [[ -e $home/$rel ]] && retire_path "$home" "$backup" "$uid" "$gid" "$rel"
+  done
+  [[ -e $home/.cache/omarchy ]] && run rm -rf "$home/.cache/omarchy"
+
+  for rel in "${seeded[@]}" .bashrc; do
+    under_any_of "$rel" "${USER_OMARCHY_DIRS[@]}" "${USER_APP_OWNED_DIRS[@]}" && continue
+    path="$home/$rel"
+    [[ -f $path && ! -L $path ]] || continue
+    grep -qsi omarchy "$path" || continue
+    retire_path "$home" "$backup" "$uid" "$gid" "$rel"
+    if [[ $rel == ".bashrc" ]]; then
+      stock_bashrc | put "$home/.bashrc"
+      run chown "$uid:$gid" "$home/.bashrc"
+    fi
+  done
+
+  # The agent skill links into Omarchy's tree.
+  for dir in "${USER_SKILL_DIRS[@]/#/$home/}" "$home"/.hermes/profiles/*/skills; do
+    [[ -d $dir ]] && dirs+=("$dir")
+  done
+  if (( ${#dirs[@]} )); then
+    run find "${dirs[@]}" -maxdepth 1 -type l \( -lname '/usr/share/omarchy/*' -o -lname "$OMARCHY_PATH/*" \) -delete
+  fi
+
+  # Links into the directories just moved, such as btop's current theme.
+  dirs=()
+  for dir in "$home/.config" "$home/.local/share"; do
+    [[ -d $dir ]] && dirs+=("$dir")
+  done
+  if (( ${#dirs[@]} )); then
+    run find "${dirs[@]}" -maxdepth 4 -type l \( -lname "$home/.config/omarchy/*" -o -lname "$home/.local/state/omarchy/*" \
+      -o -lname "$home/.local/share/omarchy/*" -o -lname '/usr/share/omarchy/*' -o -lname "$OMARCHY_PATH/*" \) -delete
+  fi
+
+  # The user units Omarchy's packages shipped leave their enablement links behind.
+  if [[ -d $home/.config/systemd/user ]]; then
+    run find "$home/.config/systemd/user" -xtype l -delete
+  fi
+}
+
+esp_path() {
+  local path
+  path=$(sed -n 's/^ESP_PATH=["'"'"']\{0,1\}\([^"'"'"']*\).*/\1/p' /etc/default/limine 2>/dev/null | tail -n 1)
+  printf '%s\n' "${path:-/boot}"
+}
+
+# The UKIs built under Omarchy's name that the rebuilt limine.conf no longer
+# lists. limine.conf hashes every file it boots, so a stale copy can only cost
+# ESP space, which a kernel update needs.
+prune_stale_ukis() {
+  local esp=$1 conf uki name
+  conf="$esp/limine.conf"
+  [[ -f $conf ]] || return 0
+  for uki in "$esp"/EFI/Linux/omarchy_*.efi; do
+    [[ -f $uki ]] || continue
+    name=${uki##*/}
+    grep -qF "/EFI/Linux/$name" "$conf" && continue
+    run rm -f "$uki"
+  done
+}
+
+rebuild_boot() {
+  if ! command -v limine-update >/dev/null 2>&1; then
+    run mkinitcpio -P
+    return
+  fi
+  local esp
+  esp=$(esp_path)
+  if [[ -f $esp/limine.conf ]]; then
+    run sed -i 's/^interface_branding: Omarchy Bootloader$/interface_branding: Arch Linux/' "$esp/limine.conf"
+  fi
+  run limine-update || return 1
+  prune_stale_ukis "$esp"
+}
+
+# The read-only snapshot the installer keeps for omarchy-system-factory-reset.
+delete_factory_snapshot() {
+  [[ $(findmnt -no FSTYPE / 2>/dev/null) == "btrfs" ]] || return 0
+  if (( dry_run )); then
+    echo "  would delete the @factory snapshot if this disk has one"
+    return 0
+  fi
+  local device top
+  device=$(findmnt -no SOURCE / | sed 's/\[.*\]//')
+  top=$(mktemp -d /run/omarchy-uninstall.XXXXXX)
+  if ! mount -o subvolid=5 "$device" "$top"; then
+    rmdir "$top"
+    warn "could not mount the Btrfs top level to look for the @factory snapshot"
+    return 1
+  fi
+  if [[ -d $top/@factory ]]; then
+    run btrfs subvolume delete "$top/@factory"
+  else
+    say "No factory-reset snapshot on this disk"
+  fi
+  umount "$top"
+  rmdir "$top"
+}
+
+report() {
+  local boot_ok=$1 entry name uid gid home
+  local foreign=()
+
+  echo
+  if (( dry_run )); then
+    say "Dry run finished; nothing was changed."
+    return 0
+  fi
+
+  say "Omarchy is uninstalled. The log is at $LOG_FILE."
+  for entry in "${users[@]}"; do
+    IFS=: read -r name uid gid home <<<"$entry"
+    if [[ -d $home/omarchy-uninstalled-$STAMP ]]; then
+      say "$name's Omarchy configuration is in $home/omarchy-uninstalled-$STAMP; delete it once you have taken what you want."
+    fi
+  done
+
+  if (( ${#repo_packages[@]} )); then
+    mapfile -t foreign < <(printf '%s\n' "${repo_packages[@]}" | comm -12 - <(pacman -Qq | sort -u))
+  fi
+  if (( ${#foreign[@]} )); then
+    echo
+    say "These installed packages came from Omarchy's repository and will no longer receive updates."
+    say "Remove them, or get them from the AUR. limine-mkinitcpio-hook and limine-snapper-sync, if listed,"
+    say "are what keep the boot entries in step with kernel updates:"
+    say "  ${foreign[*]}"
+  fi
+
+  echo
+  if (( boot_ok )); then
+    say "Reboot to finish. The computer will boot to a text login; run 'sudo pacman -Syu' there first."
+  else
+    warn "rebuilding the boot files failed. Run 'limine-update' and make sure it succeeds before rebooting."
+  fi
+
+  (( assume_yes )) && return 0
+  local answer
+  read -rp 'Reboot now? [y/N] ' answer
+  [[ $answer == [Yy]* ]] && systemctl reboot
+  return 0
+}
+
+on_error() {
+  echo "omarchy-uninstall stopped before removing anything. What it wrote so far is harmless; fix the problem and run it again." >&2
+}
+
+main() {
+  preflight
+  gather
+
+  if (( dry_run )); then
+    say "Dry run: nothing will be changed."
+  else
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+    log "=== omarchy-uninstall started $(date '+%Y-%m-%d %H:%M:%S') ==="
+  fi
+  confirm
+
+  trap on_error ERR
+  step "Keeping the boot configuration Omarchy's packages carry"
+  keep_boot_config /etc
+  if (( swap_kernel )); then
+    step "Installing the stock Arch kernel"
+    install_stock_kernel
+  fi
+  step "Protecting the base system from the dependency sweep"
+  protect_base_system
+  step "Disabling Omarchy's services"
+  disable_services
+  step "Removing packages"
+  remove_packages
+  trap - ERR
+
+  # Past the point of no return: everything from here is best effort.
+  local entry name uid gid home boot_ok=1
+  step "Forgetting Omarchy's package repository"
+  forget_repository || true
+  step "Removing Omarchy's system configuration"
+  clean_system_files || true
+  step "Retiring each user's Omarchy configuration"
+  for entry in "${users[@]}"; do
+    IFS=: read -r name uid gid home <<<"$entry"
+    retire_user_config "$name" "$uid" "$gid" "$home" || true
+  done
+  step "Rebuilding the boot files"
+  rebuild_boot || boot_ok=0
+  step "Removing the factory-reset snapshot"
+  delete_factory_snapshot || true
+
+  report "$boot_ok"
+}
+
+main
