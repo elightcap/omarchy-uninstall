@@ -1,0 +1,339 @@
+#!/bin/bash
+
+# Runs omarchy-uninstall on a throwaway Omarchy VM, then boots what is left.
+#
+#   test/vm [--keep] [--boot firmware|kernel]
+#
+# Fetches the installed Omarchy VM image that nightly.omarchy.org publishes
+# (the one Omarchy's own CI tests on), boots a copy-on-write overlay of it under
+# KVM, runs the uninstall in it over SSH with the desktop session ended, shuts
+# it down, and boots the same disk again through UEFI firmware, so Limine and
+# the rebuilt UKI are what bring it up. That second boot is checked over SSH:
+# no Omarchy packages, Arch's os-release, the stock kernel, a package manager
+# and network that work. Everything it saw lands in the run directory it
+# prints: the uninstall's output and log, the state before and after, serial
+# logs and screenshots of both boots.
+#
+# The first boot goes through the firmware too, so the image's own boot chain
+# is proven before anything changes; --boot kernel loads the kernel directly
+# the way CI does instead. --keep leaves the run's disk behind for a look.
+#
+# Env: OMARCHY_UNINSTALL_CACHE (image and runs, default ~/.cache/omarchy-uninstall),
+#      MEM (default 6G), SMP (default 4), SITE (default https://nightly.omarchy.org)
+
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+cache=${OMARCHY_UNINSTALL_CACHE:-$HOME/.cache/omarchy-uninstall}
+site=${SITE:-https://nightly.omarchy.org}
+image=$cache/image
+ovmf=/usr/share/edk2/x64
+keep=0
+first_boot=firmware
+
+while (($#)); do
+  case $1 in
+    --keep) keep=1 ;;
+    --boot)
+      first_boot=${2:-}
+      shift
+      ;;
+    *)
+      echo "Usage: test/vm [--keep] [--boot firmware|kernel]" >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+case $first_boot in
+  firmware | kernel) ;;
+  *)
+    echo "test/vm: --boot takes firmware or kernel" >&2
+    exit 1
+    ;;
+esac
+
+for tool in qemu-system-x86_64 qemu-img ssh-keygen jq curl socat; do
+  command -v "$tool" >/dev/null || { echo "test/vm: $tool is needed" >&2; exit 1; }
+done
+[[ -f $ovmf/OVMF_CODE.4m.fd ]] || { echo "test/vm: edk2-ovmf is needed ($ovmf)" >&2; exit 1; }
+
+run=$cache/runs/$(date +%Y%m%d-%H%M%S)
+mkdir -p "$run"
+port=$(( 20000 + RANDOM % 10000 ))
+uuid=$(cat /proc/sys/kernel/random/uuid)
+started=$SECONDS
+
+seconds() { echo $(( SECONDS - started )); }
+
+say() {
+  printf 'test/vm: %s (%ss)\n' "$1" "$(seconds)" | tee -a "$run/harness.log"
+}
+
+ssh_vm() {
+  ssh -i "$run/id_ed25519" -p "$port" -o BatchMode=yes -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o ConnectTimeout="${CONNECT_TIMEOUT:-5}" -o LogLevel=ERROR omarchy@127.0.0.1 "$@"
+}
+
+fetch_image() {
+  mkdir -p "$image"
+  curl -fsS --retry 3 -o "$image/latest.json" "$site/stable/latest.json"
+  local sha url unpacked version file
+  sha=$(jq -r .vm.sha256 "$image/latest.json")
+  url=$(jq -r .vm.url "$image/latest.json")
+  unpacked=$(jq -r .vm.unpacked "$image/latest.json")
+  version=$(jq -r .omarchy_version "$image/latest.json")
+  if [[ -f $image/base.qcow2 && $(cat "$image/base.sha256" 2>/dev/null) == "$sha" ]]; then
+    say "image cached: Omarchy $version"
+    return 0
+  fi
+  say "fetching the Omarchy $version image ($(( $(jq -r .vm.size "$image/latest.json") / 1048576 )) MB)"
+  rm -f "$image/base.qcow2" "$image/base.sha256" "$image/vmlinuz" "$image/initrd" "$image/cmdline"
+  curl -fL --retry 3 -C - -o "$image/base.qcow2.part" "$url"
+  echo "$sha  $image/base.qcow2.part" | sha256sum -c - >/dev/null
+  mv "$image/base.qcow2.part" "$image/base.qcow2"
+  for file in vmlinuz initrd cmdline; do
+    curl -fsS --retry 3 -o "$image/$file" "$unpacked$file"
+  done
+  echo "$sha" >"$image/base.sha256"
+  say "image fetched"
+}
+
+# The key and the sudo grant for this run, handed in through the firmware
+# tables as a systemd credential the way CI does: the image holds neither.
+credentials() {
+  ssh-keygen -q -t ed25519 -N '' -C omarchy-uninstall-vm -f "$run/id_ed25519"
+  printf 'd /home/omarchy/.ssh 0700 omarchy omarchy -\nf+ /home/omarchy/.ssh/authorized_keys 0600 omarchy omarchy - %s\nf+ /etc/sudoers.d/90-vm-test 0440 root root - omarchy ALL=(ALL) NOPASSWD:ALL\\n\n' \
+    "$(cat "$run/id_ed25519.pub")" | base64 -w0
+}
+
+boot_vm() {
+  local how=$1 label=$2
+  # shellcheck disable=SC2054  # the commas are qemu's own option syntax
+  local args=(
+    -cpu host -enable-kvm -machine q35,accel=kvm -smp "${SMP:-4}" -m "${MEM:-6G}" -uuid "$uuid"
+    -drive "file=$run/run.qcow2,format=qcow2,if=none,id=d0" -device virtio-blk-pci,drive=d0
+    -smbios "type=11,value=io.systemd.credential.binary:tmpfiles.extra=$creds"
+    -device virtio-vga -device virtio-rng-pci -display none
+    -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:22" -device virtio-net-pci,netdev=n0
+    -monitor "unix:$run/monitor.sock,server,nowait" -serial "file:$run/serial-$label.log"
+    -pidfile "$run/qemu.pid" -daemonize
+  )
+  if [[ $how == "kernel" ]]; then
+    args+=(-kernel "$image/vmlinuz" -initrd "$image/initrd" -append "$(cat "$image/cmdline") systemd.tty.term.console=dumb")
+  else
+    [[ -f $run/OVMF_VARS.fd ]] || cp "$ovmf/OVMF_VARS.4m.fd" "$run/OVMF_VARS.fd"
+    args+=(-drive "if=pflash,format=raw,readonly=on,file=$ovmf/OVMF_CODE.4m.fd" -drive "if=pflash,format=raw,file=$run/OVMF_VARS.fd")
+  fi
+  rm -f "$run/qemu.pid" "$run/monitor.sock"
+  qemu-system-x86_64 "${args[@]}"
+  say "booted ($how) as $label"
+}
+
+screenshot() {
+  local label=$1
+  [[ -S $run/monitor.sock ]] || return 0
+  printf 'screendump %s\n' "$run/screen-$label.ppm" | socat - "UNIX-CONNECT:$run/monitor.sock" >/dev/null 2>&1 || return 0
+  sleep 0.5
+  if command -v magick >/dev/null && [[ -f $run/screen-$label.ppm ]]; then
+    magick "$run/screen-$label.ppm" "$run/screen-$label.png" 2>/dev/null && rm -f "$run/screen-$label.ppm"
+  fi
+}
+
+# Waits for SSH, taking a screenshot every 30 s so a boot that stops somewhere
+# leaves a picture of where.
+wait_ssh() {
+  local limit=$1 label=$2 from waited=0 shot=0
+  from=$(seconds)
+  until CONNECT_TIMEOUT=1 ssh_vm true 2>/dev/null; do
+    waited=$(( $(seconds) - from ))
+    (( waited < limit )) || return 1
+    if (( waited - shot >= 30 )); then
+      screenshot "$label-${waited}s"
+      shot=$waited
+    fi
+    sleep 1
+  done
+  say "SSH up as $label after $(( $(seconds) - from )) s"
+}
+
+stop_vm() {
+  local pid waited=0
+  pid=$(cat "$run/qemu.pid" 2>/dev/null) || return 0
+  # Over SSH where it answers, else the power button through the monitor.
+  if ! CONNECT_TIMEOUT=3 ssh_vm 'sudo systemctl poweroff' >/dev/null 2>&1; then
+    printf 'system_powerdown\n' | socat - "UNIX-CONNECT:$run/monitor.sock" >/dev/null 2>&1 || true
+  fi
+  while kill -0 "$pid" 2>/dev/null && (( waited < 90 )); do
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    say "powering the VM off the hard way"
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$run/qemu.pid"
+}
+
+# The disk stays for a look after a failed run, and after any run with --keep.
+cleanup() {
+  local status=$?
+  screenshot final
+  stop_vm
+  if (( keep || status != 0 )); then
+    say "disk kept: $run/run.qcow2"
+  else
+    rm -f "$run/run.qcow2" "$run/OVMF_VARS.fd"
+  fi
+  rm -f "$run/monitor.sock"
+}
+trap cleanup EXIT
+
+# Where the desktop session's compositor still runs, the uninstall refuses.
+end_desktop() {
+  ssh_vm 'sudo systemctl stop sddm.service' >/dev/null 2>&1 || true
+  local from
+  from=$(seconds)
+  while ssh_vm 'for s in $(loginctl list-sessions --no-legend | awk "{print \$1}"); do loginctl show-session "$s" -p Type --value; done | grep -qx wayland' 2>/dev/null; do
+    (( $(seconds) - from < 60 )) || { say "the desktop session did not end"; return 1; }
+    sleep 1
+  done
+  say "desktop session ended"
+}
+
+state_report() {
+  ssh_vm 'set +e
+    echo "== kernel";      uname -r
+    echo "== cmdline";     cat /proc/cmdline
+    echo "== os-release";  head -3 /etc/os-release
+    echo "== machine-id";  cat /etc/machine-id
+    echo "== omarchy packages"; pacman -Qq 2>/dev/null | grep -E "^omarchy|^linux" | tr "\n" " "; echo
+    echo "== package count"; pacman -Qq 2>/dev/null | wc -l
+    echo "== foreign packages"; pacman -Qmq 2>/dev/null | tr "\n" " "; echo
+    echo "== orphans"; pacman -Qdtq 2>/dev/null | wc -l
+    echo "== system state"; systemctl is-system-running; systemctl --failed --no-legend
+    echo "== network"; nmcli -t -f STATE general 2>&1
+    echo "== sessions"; loginctl list-sessions --no-legend
+    echo "== ESP"; sudo ls -la /boot/EFI/Linux 2>&1; echo; sudo cat /boot/limine.conf 2>&1
+    echo "== boot tree"; sudo limine-entry-tool --tree 4 2>&1
+    echo "== kernel module trees"; ls /usr/lib/modules; cat /var/lib/limine/removed_kernels.list 2>/dev/null
+    echo "== mkinitcpio drop-ins"; ls /etc/mkinitcpio.conf.d 2>&1; cat /etc/mkinitcpio.conf.d/00-hooks.conf 2>/dev/null
+    echo "== limine drop-ins"; ls /etc/limine-entry-tool.d 2>&1; cat /etc/limine-entry-tool.d/10-boot-entries.conf 2>/dev/null; cat /etc/default/limine
+    echo "== pacman.conf"; grep "^\[" /etc/pacman.conf | tr "\n" " "; echo; grep -v "^#" /etc/pacman.d/mirrorlist | grep . | head -3
+    echo "== home"; ls -a ~ | tr "\n" " "; echo
+    echo "== errors this boot"; journalctl -b -p err --no-pager 2>&1 | tail -20'
+}
+
+fetch_image
+creds=$(credentials)
+qemu-img create -qf qcow2 -b "$(realpath "$image/base.qcow2")" -F qcow2 "$run/run.qcow2"
+say "run directory: $run"
+
+# Phase 1: the image as published, and the uninstall on it.
+boot_vm "$first_boot" before
+if ! wait_ssh 240 before; then
+  if [[ $first_boot == "firmware" ]]; then
+    say "the image did not come up through the firmware in 240 s; loading the kernel directly instead"
+    screenshot before-firmware-stuck
+    stop_vm
+    boot_vm kernel before
+    wait_ssh 300 before || { say "no SSH after a direct kernel boot either"; exit 1; }
+  else
+    say "no SSH after 240 s"
+    exit 1
+  fi
+fi
+state_report >"$run/before.txt" 2>&1 || true
+screenshot before
+
+ssh_vm 'cat >~/omarchy-uninstall && chmod +x ~/omarchy-uninstall' <"$root/omarchy-uninstall"
+# The published image is built with an empty machine-id, so each VM takes its
+# own from -uuid at first boot, and the boot entry the build wrote is keyed to
+# no machine. An installed Omarchy's entry carries the machine's id, which is
+# what limine-update updates in place; key it the way the installer would have,
+# so the test exercises a real machine's boot rebuild and not the image's quirk.
+ssh_vm 'id=$(cat /etc/machine-id); sudo sed -i "/^\/+Omarchy/,/^\/[^\/]/ s/^comment: order-priority=/comment: machine-id=$id order-priority=/" /boot/limine.conf'
+
+# shellcheck disable=SC2088  # the tilde expands in the VM's shell
+ssh_vm '~/omarchy-uninstall --dry-run' >"$run/dry-run.txt" 2>&1 || say "the dry run exited $? (see dry-run.txt)"
+say "dry run done: $(grep -c '^    [a-z0-9]' "$run/dry-run.txt") packages listed"
+
+end_desktop
+
+# The uninstall's output also goes to the serial console, which this side reads
+# as a file, so progress and the finishing line arrive even if SSH dies: the
+# image's kernel command line names ttyS0 as a console.
+command='set -o pipefail; /home/omarchy/omarchy-uninstall --yes 2>&1 | tee /var/tmp/uninstall.log >/dev/ttyS0; rc=$?; echo "$rc" >/var/tmp/uninstall.rc; echo "UNINSTALL-DONE rc=$rc" >/dev/ttyS0'
+ssh_vm "sudo systemd-run --quiet --collect --unit=omarchy-uninstall-test bash -c $(printf %q "$command")"
+say "uninstall started"
+from=$(seconds)
+last=""
+until grep -q '^UNINSTALL-DONE rc=' "$run/serial-before.log" 2>/dev/null; do
+  if (( $(seconds) - from >= ${UNINSTALL_TIMEOUT:-1800} )); then
+    say "the uninstall did not finish in ${UNINSTALL_TIMEOUT:-1800} s"
+    exit 1
+  fi
+  line=$(tr -d '\r' <"$run/serial-before.log" | grep -v '^    \|^\[\|^ *$' | tail -n 1 || true)
+  if [[ -n $line && $line != "$last" ]]; then
+    say "  $line"
+    last=$line
+  fi
+  sleep 5
+done
+rc=$(grep -o '^UNINSTALL-DONE rc=[0-9]*' "$run/serial-before.log" | tail -n 1 | cut -d= -f2)
+if CONNECT_TIMEOUT=3 ssh_vm true 2>/dev/null; then
+  ssh_vm 'cat /var/tmp/uninstall.log' >"$run/uninstall.txt" 2>&1 || true
+  ssh_vm 'sudo cat /var/log/omarchy-uninstall.log' >"$run/omarchy-uninstall.log" 2>&1 || true
+else
+  say "SSH is gone after the uninstall; its output is in serial-before.log"
+  tr -d '\r' <"$run/serial-before.log" >"$run/uninstall.txt"
+fi
+say "uninstall finished with status $rc after $(( $(seconds) - from )) s"
+state_report >"$run/after-uninstall.txt" 2>&1 || true
+screenshot after-uninstall
+stop_vm
+say "VM powered off"
+
+# Phase 2: what is left, through the firmware, Limine and the rebuilt UKI.
+boot_vm firmware after
+if ! wait_ssh 300 after; then
+  if grep -q 'login:' "$run/serial-after.log" 2>/dev/null; then
+    say "FAIL: the uninstalled system booted to a login prompt but SSH never answered (see serial-after.log)"
+  else
+    say "FAIL: the uninstalled system did not come up through the firmware in 300 s (see screen-after-*.png and serial-after.log)"
+  fi
+  exit 1
+fi
+state_report >"$run/after-boot.txt" 2>&1 || true
+screenshot after-boot
+ssh_vm 'sudo pacman -Sy 2>&1 | tail -n 4' >"$run/pacman-sy.txt" 2>&1 || true
+
+verdict=0
+check() {
+  if "$@"; then
+    say "ok: ${*: -1}"
+  else
+    say "FAIL: ${*: -1}"
+    verdict=1
+  fi
+}
+grep_after() { grep -qE "$1" "$run/after-boot.txt"; }
+check bash -c "! grep -qE '^omarchy(-| |$)' <(sed -n '/^== omarchy packages/{n;p}' '$run/after-boot.txt')" "no omarchy packages remain"
+check bash -c "sed -n '/^== kernel/{n;p}' '$run/after-boot.txt' | grep -qv omarchy" "the stock kernel boots"
+check grep_after '^ID=arch$' "os-release is Arch's again"
+check bash -c "grep -q 'is up to date\|downloading' '$run/pacman-sy.txt'" "pacman reaches its mirrors"
+check bash -c "sed -n '/^== network/{n;p}' '$run/after-boot.txt' | grep -q connected" "NetworkManager is connected"
+check bash -c "! sed -n '/^== pacman.conf/{n;p}' '$run/after-boot.txt' | grep -q omarchy" "the omarchy repository is gone from pacman.conf"
+check bash -c "sed -n '/^== home/{n;p}' '$run/after-boot.txt' | grep -q omarchy-uninstalled-" "the user's Omarchy configuration was moved aside"
+check bash -c "! grep -q 'kernel-id=linux-omarchy' '$run/after-boot.txt'" "no boot entry is left for the removed kernel"
+check bash -c "grep -q '^/+Arch Linux' '$run/after-boot.txt'" "the boot menu's OS entry is Arch Linux"
+check bash -c "[[ \$(grep -o '^UNINSTALL-DONE rc=[0-9]*' '$run/serial-before.log' | tail -n 1) == 'UNINSTALL-DONE rc=0' ]]" "the uninstall exited 0"
+
+if (( verdict == 0 )); then
+  say "PASS: Omarchy uninstalled and the machine boots plain Arch Linux"
+else
+  say "FAIL: see $run"
+fi
+exit "$verdict"
