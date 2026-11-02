@@ -458,11 +458,17 @@ strip_omarchy_repos() {
   rm -f "$tmp"
 }
 
+has_active_server() {
+  grep -qE '^[[:space:]]*Server[[:space:]]*=' "$1"
+}
+
 restore_mirrorlist() {
   local list=/etc/pacman.d/mirrorlist
   grep -qs 'omarchy' "$list" || return 0
-  # pacman-mirrorlist leaves its own list beside Omarchy's as a .pacnew.
-  if [[ -f $list.pacnew ]] && ! grep -q omarchy "$list.pacnew"; then
+  # pacman-mirrorlist leaves its own list beside Omarchy's as a .pacnew. Arch
+  # ships that list with every server commented out, so it is only taken when
+  # someone has uncommented one; otherwise pacman would be left with none.
+  if [[ -f $list.pacnew ]] && ! grep -q omarchy "$list.pacnew" && has_active_server "$list.pacnew"; then
     run mv -f "$list.pacnew" "$list"
     return 0
   fi

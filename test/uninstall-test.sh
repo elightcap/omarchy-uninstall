@@ -228,3 +228,18 @@ pass "kernel entries are listed by their menu path"
 stale=$(with_uninstall_functions "pacman() { [[ \$2 == linux ]]; }; stale_boot_entries $tmp/limine.conf")
 [[ $stale == "linux-omarchy" ]] || fail "a kernel entry whose package is gone is stale" "$stale"
 pass "a kernel entry whose package is gone is stale"
+
+# The mirrorlist: Arch's stock .pacnew has every server commented out, so it
+# must not replace Omarchy's; one with a server uncommented may.
+mkdir -p "$tmp/mirrors"
+printf 'Server = https://stable-mirror.omarchy.org/$repo/os/$arch\n' >"$tmp/mirrors/mirrorlist"
+printf '## Worldwide\n#Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n' >"$tmp/mirrors/mirrorlist.pacnew"
+with_uninstall_functions "platform=x86; put() { cat >\"\$1\"; }; restore_mirrorlist() { $(sed -n '/^restore_mirrorlist() {/,/^}/p' "$ROOT/omarchy-uninstall" | sed '1d;$d' | sed "s|/etc/pacman.d/mirrorlist|$tmp/mirrors/mirrorlist|"); }; restore_mirrorlist"
+grep -q '^Server = https://geo.mirror.pkgbuild.com' "$tmp/mirrors/mirrorlist" || fail "an all-commented .pacnew does not replace the mirrorlist" "$(cat "$tmp/mirrors/mirrorlist")"
+pass "an all-commented .pacnew does not replace the mirrorlist"
+printf 'Server = https://stable-mirror.omarchy.org/$repo/os/$arch\n' >"$tmp/mirrors/mirrorlist"
+printf 'Server = https://mirror.example.org/$repo/os/$arch\n' >"$tmp/mirrors/mirrorlist.pacnew"
+with_uninstall_functions "platform=x86; put() { cat >\"\$1\"; }; restore_mirrorlist() { $(sed -n '/^restore_mirrorlist() {/,/^}/p' "$ROOT/omarchy-uninstall" | sed '1d;$d' | sed "s|/etc/pacman.d/mirrorlist|$tmp/mirrors/mirrorlist|"); }; restore_mirrorlist"
+grep -qx 'Server = https://mirror.example.org/$repo/os/$arch' "$tmp/mirrors/mirrorlist" || fail "a .pacnew with a live server replaces the mirrorlist" "$(cat "$tmp/mirrors/mirrorlist")"
+pass "a .pacnew with a live server replaces the mirrorlist"
+
